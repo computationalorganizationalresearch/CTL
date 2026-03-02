@@ -45,7 +45,15 @@ MAX_HAND = 8
 MAX_FIELD = 16
 CARD_DIM = 52
 STATE_DIM = CARD_DIM * 6 + 16
-ACTION_DIM = 64
+
+ACTION_TYPE_DIM = len(ActionType)
+ACTION_CARD_OFFSET = ACTION_TYPE_DIM
+ACTION_TARGET_PLAYER_OFFSET = ACTION_CARD_OFFSET + CARD_DIM
+ACTION_TARGET_ZONE_OFFSET = ACTION_TARGET_PLAYER_OFFSET + 2
+ACTION_TARGET_INDEX_OFFSET = ACTION_TARGET_ZONE_OFFSET + 2
+ACTION_AUX_INDEX_OFFSET = ACTION_TARGET_INDEX_OFFSET + 8
+ACTION_BIAS_OFFSET = ACTION_AUX_INDEX_OFFSET + 8
+ACTION_DIM = ACTION_BIAS_OFFSET + 1
 
 RANK_TO_I = {r: i for i, r in enumerate(RANK_ORDER)}
 SUIT_TO_I = {s: i for i, s in enumerate(SUIT_ORDER)}
@@ -109,19 +117,18 @@ def encode_action(game: CuttleGameState, action: Action) -> np.ndarray:
     me = game.players[game.turn]
     if action.hand_index is not None and 0 <= action.hand_index < len(me.hand):
         c = me.hand[action.hand_index]
-        out[8 + card_index(c)] = 1.0
+        out[ACTION_CARD_OFFSET + card_index(c)] = 1.0
 
-    base = 8 + CARD_DIM
-    out[base + (action.target_player or 0)] = 1.0
+    out[ACTION_TARGET_PLAYER_OFFSET + (action.target_player or 0)] = 1.0
     zone = 0 if action.target_zone in (None, "point") else 1
-    out[base + 2 + zone] = 1.0
+    out[ACTION_TARGET_ZONE_OFFSET + zone] = 1.0
 
     if action.target_index is not None:
-        out[base + 4 + min(action.target_index, 7)] = 1.0
+        out[ACTION_TARGET_INDEX_OFFSET + min(action.target_index, 7)] = 1.0
     if action.aux_index is not None:
-        out[base + 12 + min(action.aux_index, 7)] = 1.0
+        out[ACTION_AUX_INDEX_OFFSET + min(action.aux_index, 7)] = 1.0
 
-    out[-1] = 1.0  # bias feature
+    out[ACTION_BIAS_OFFSET] = 1.0  # bias feature
     return out
 
 
@@ -291,8 +298,8 @@ def train_step(
         start = len(action_feats_np)
         for vi in valid:
             af = np.zeros(ACTION_DIM, dtype=np.float32)
-            af[-1] = 1.0
-            af[8 + (vi % CARD_DIM)] = 1.0
+            af[ACTION_BIAS_OFFSET] = 1.0
+            af[ACTION_CARD_OFFSET + (vi % CARD_DIM)] = 1.0
             action_feats_np.append(af)
             action_batch_idx.append(bi)
         target_idx.append(start + int(np.argmax(dense[valid])))
