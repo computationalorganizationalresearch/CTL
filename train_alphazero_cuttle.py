@@ -178,6 +178,34 @@ class StepRecord:
     value_player: int
 
 
+@dataclasses.dataclass
+class EvalMetrics:
+    wins: int
+    losses: int
+    draws: int
+    avg_turns: float
+
+    @property
+    def win_rate(self) -> float:
+        return self.wins / max(self.total_games, 1)
+
+    @property
+    def draw_rate(self) -> float:
+        return self.draws / max(self.total_games, 1)
+
+    @property
+    def decisive_rate(self) -> float:
+        return (self.wins + self.losses) / max(self.total_games, 1)
+
+    @property
+    def score(self) -> float:
+        return (self.wins + 0.5 * self.draws) / max(self.total_games, 1)
+
+    @property
+    def total_games(self) -> int:
+        return self.wins + self.losses + self.draws
+
+
 class ReplayBuffer:
     def __init__(self, capacity: int):
         self.capacity = capacity
@@ -349,6 +377,11 @@ def export_best_onnx(model: PolicyValueNet, path: str, device: torch.device) -> 
     )
 
 
+def elo_from_score(score: float, baseline_elo: float = 1000.0) -> float:
+    clipped = min(max(score, 1e-6), 1.0 - 1e-6)
+    return baseline_elo + 400.0 * math.log10(clipped / (1.0 - clipped))
+
+
 def run(args: argparse.Namespace) -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -360,7 +393,9 @@ def run(args: argparse.Namespace) -> None:
     replay = ReplayBuffer(capacity=args.replay_capacity)
 
     best_score = -1e9
+    best_elo = float("-inf")
     finished_games = 0
+    decisive_finished_games = 0
     total_steps = 0
     start_time = time.time()
 
@@ -396,6 +431,8 @@ def run(args: argparse.Namespace) -> None:
                     g.stalemate = True
                 replay.add_episode(episodes[gi], g.winner, g.stalemate)
                 finished_games += 1
+                if g.winner is not None:
+                    decisive_finished_games += 1
 
                 games[gi] = CuttleGameState.new_game(seed=args.seed + finished_games + gi)
                 episodes[gi] = []
@@ -406,7 +443,8 @@ def run(args: argparse.Namespace) -> None:
                     sps = total_steps / max(elapsed, 1e-6)
                     print(
                         f"games={finished_games}/{args.num_games} "
-                        f"replay={len(replay)} gps={gps:.2f} steps/s={sps:.2f}",
+                        f"replay={len(replay)} gps={gps:.2f} steps/s={sps:.2f} "
+                        f"winner_fraction={decisive_finished_games / max(finished_games, 1):.3f}",
                         flush=True,
                     )
 
@@ -416,13 +454,25 @@ def run(args: argparse.Namespace) -> None:
                 break
 
         if finished_games > 0 and finished_games % args.eval_every == 0:
-            score = evaluate_vs_random(model, device, games=args.eval_games, max_turns=args.max_turns)
-            print(f"eval_score={score:.4f}", flush=True)
+            eval_metrics = evaluate_vs_random(model, device, games=args.eval_games, max_turns=args.max_turns)
+            score = eval_metrics.score
+            current_elo = elo_from_score(score)
+            print(
+                f"eval games={eval_metrics.total_games} score={score:.4f} elo={current_elo:.1f} "
+                f"wins={eval_metrics.wins} losses={eval_metrics.losses} draws={eval_metrics.draws} "
+                f"win_rate={eval_metrics.win_rate:.3f} draw_rate={eval_metrics.draw_rate:.3f} "
+                f"decisive_rate={eval_metrics.decisive_rate:.3f} avg_turns={eval_metrics.avg_turns:.1f} "
+                f"best_elo={max(best_elo, current_elo):.1f}"
+            )
             if score > best_score:
                 best_score = score
+                best_elo = current_elo
                 torch.save(model.state_dict(), args.save_best_pt)
                 export_best_onnx(model, args.save_best_onnx, device)
-                print(f"new_best={best_score:.4f} saved to {args.save_best_onnx}", flush=True)
+                print(
+                    f"new_best score={best_score:.4f} elo={best_elo:.1f} saved to {args.save_best_onnx}",
+                    flush=True,
+                )
 
     if not os.path.exists(args.save_best_onnx):
         torch.save(model.state_dict(), args.save_best_pt)
@@ -431,14 +481,17 @@ def run(args: argparse.Namespace) -> None:
     elapsed = time.time() - start_time
     print(
         f"Done. games={finished_games}, elapsed={elapsed/3600:.2f}h, "
-        f"games/hour={finished_games / max(elapsed/3600, 1e-6):.0f}, best_score={best_score:.4f}",
+        f"games/hour={finished_games / max(elapsed/3600, 1e-6):.0f}, best_score={best_score:.4f}, "
+        f"best_elo={best_elo:.1f}, winner_fraction={decisive_finished_games / max(finished_games, 1):.3f}",
         flush=True,
     )
 
 
-def evaluate_vs_random(model: PolicyValueNet, device: torch.device, games: int, max_turns: int) -> float:
+def evaluate_vs_random(model: PolicyValueNet, device: torch.device, games: int, max_turns: int) -> EvalMetrics:
     wins = 0
+    losses = 0
     draws = 0
+    total_turns = 0
     model.eval()
     with torch.no_grad():
         for seed in range(games):
@@ -456,12 +509,15 @@ def evaluate_vs_random(model: PolicyValueNet, device: torch.device, games: int, 
                 else:
                     g.apply(random.choice(legal))
                 turns += 1
+            total_turns += turns
             if g.winner == 0:
                 wins += 1
+            elif g.winner == 1:
+                losses += 1
             elif g.winner is None:
                 draws += 1
     model.train()
-    return (wins + 0.5 * draws) / games
+    return EvalMetrics(wins=wins, losses=losses, draws=draws, avg_turns=total_turns / max(games, 1))
 
 
 def parse_args() -> argparse.Namespace:
