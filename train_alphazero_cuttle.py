@@ -401,6 +401,8 @@ def run(args: argparse.Namespace) -> None:
     decisive_finished_games = 0
     total_steps = 0
     start_time = time.time()
+    eval_interval = max(1, args.eval_every)
+    next_eval_at = eval_interval
 
     games = [CuttleGameState.new_game(seed=args.seed + i) for i in range(args.parallel_games)]
     episodes: List[List[StepRecord]] = [[] for _ in games]
@@ -458,16 +460,17 @@ def run(args: argparse.Namespace) -> None:
             if out is None:
                 break
 
-        if finished_games > 0 and finished_games % args.eval_every == 0:
+        while finished_games >= next_eval_at:
             eval_metrics = evaluate_vs_random(model, device, games=args.eval_games, max_turns=args.max_turns)
             score = eval_metrics.score
             current_elo = elo_from_score(score)
             print(
-                f"eval games={eval_metrics.total_games} score={score:.4f} elo={current_elo:.1f} "
+                f"eval_at={next_eval_at} games={eval_metrics.total_games} score={score:.4f} elo={current_elo:.1f} "
                 f"wins={eval_metrics.wins} losses={eval_metrics.losses} draws={eval_metrics.draws} "
                 f"win_rate={eval_metrics.win_rate:.3f} draw_rate={eval_metrics.draw_rate:.3f} "
                 f"decisive_rate={eval_metrics.decisive_rate:.3f} avg_turns={eval_metrics.avg_turns:.1f} "
-                f"best_elo={max(best_elo, current_elo):.1f}"
+                f"best_elo={max(best_elo, current_elo):.1f}",
+                flush=True,
             )
             if score > best_score:
                 best_score = score
@@ -478,6 +481,7 @@ def run(args: argparse.Namespace) -> None:
                     f"new_best score={best_score:.4f} elo={best_elo:.1f} saved to {args.save_best_onnx}",
                     flush=True,
                 )
+            next_eval_at += eval_interval
 
     if not os.path.exists(args.save_best_onnx):
         torch.save(model.state_dict(), args.save_best_pt)
