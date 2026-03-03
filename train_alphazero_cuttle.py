@@ -174,6 +174,7 @@ class PolicyValueNet(nn.Module):
 @dataclasses.dataclass
 class StepRecord:
     state: np.ndarray
+    action_features: np.ndarray
     policy: np.ndarray
     value_player: int
 
@@ -209,27 +210,28 @@ class EvalMetrics:
 class ReplayBuffer:
     def __init__(self, capacity: int):
         self.capacity = capacity
-        self.items: Deque[Tuple[np.ndarray, np.ndarray, float]] = collections.deque(maxlen=capacity)
+        self.items: Deque[Tuple[np.ndarray, np.ndarray, np.ndarray, float]] = collections.deque(maxlen=capacity)
 
     def add_episode(self, episode: List[StepRecord], winner: Optional[int], stalemate: bool) -> None:
         if stalemate or winner is None:
             z = 0.0
             for rec in episode:
-                self.items.append((rec.state, rec.policy, z))
+                self.items.append((rec.state, rec.action_features, rec.policy, z))
             return
         for rec in episode:
             z = 1.0 if rec.value_player == winner else -1.0
-            self.items.append((rec.state, rec.policy, z))
+            self.items.append((rec.state, rec.action_features, rec.policy, z))
 
     def __len__(self) -> int:
         return len(self.items)
 
     def sample(self, batch_size: int):
         batch = random.sample(self.items, batch_size)
-        s = torch.from_numpy(np.stack([x[0] for x in batch]))
-        p = [x[1] for x in batch]
-        z = torch.tensor([x[2] for x in batch], dtype=torch.float32)
-        return s, p, z
+        states = torch.from_numpy(np.stack([x[0] for x in batch]))
+        action_feats = [x[1] for x in batch]
+        policies = [x[2] for x in batch]
+        z = torch.tensor([x[3] for x in batch], dtype=torch.float32)
+        return states, action_feats, policies, z
 
 
 def masked_policy_from_logits(logits: np.ndarray, temperature: float) -> np.ndarray:
@@ -250,7 +252,7 @@ def choose_actions_batched(
     dirichlet_alpha: float,
     dirichlet_eps: float,
     temperature: float,
-) -> Tuple[List[Action], List[np.ndarray], List[np.ndarray], List[int]]:
+) -> Tuple[List[Action], List[np.ndarray], List[np.ndarray], List[np.ndarray], List[int]]:
     """Runs one large GPU inference pass for all active games and picks actions."""
     legal_lists: List[List[Action]] = [g.legal_actions() for g in games]
     states_np = [encode_state(g) for g in games]
@@ -272,11 +274,11 @@ def choose_actions_batched(
     action_batch_index = torch.tensor(action_batch_idx, dtype=torch.long, device=device)
 
     with torch.no_grad():
-        logits_t, values_t = model(states, action_feats, action_batch_index)
+        logits_t, _ = model(states, action_feats, action_batch_index)
     logits = logits_t.detach().cpu().numpy()
-    values = values_t.detach().cpu().numpy()
 
     chosen_actions: List[Action] = []
+    action_feat_targets: List[np.ndarray] = []
     target_policies: List[np.ndarray] = []
     value_players: List[int] = []
 
@@ -293,13 +295,11 @@ def choose_actions_batched(
         ai = int(np.random.choice(len(acts), p=policy))
         chosen_actions.append(acts[ai])
 
-        dense_policy = np.zeros(256, dtype=np.float32)
-        capped = min(len(policy), 256)
-        dense_policy[:capped] = policy[:capped]
-        target_policies.append(dense_policy)
+        action_feat_targets.append(np.stack([encode_action(g, a) for a in acts]).astype(np.float32))
+        target_policies.append(policy.astype(np.float32))
         value_players.append(g.turn)
 
-    return chosen_actions, states_np, target_policies, value_players
+    return chosen_actions, states_np, action_feat_targets, target_policies, value_players
 
 
 def train_step(
@@ -312,36 +312,39 @@ def train_step(
     if len(replay) < batch_size:
         return None
 
-    states_cpu, policies_list, z = replay.sample(batch_size)
+    states_cpu, action_feats_list, policies_list, z = replay.sample(batch_size)
     states = states_cpu.to(device)
     z = z.to(device)
 
-    action_feats_np: List[np.ndarray] = []
+    flat_action_feats: List[np.ndarray] = []
+    flat_policy_targets: List[np.ndarray] = []
     action_batch_idx: List[int] = []
-    target_idx = []
-    for bi, dense in enumerate(policies_list):
-        valid = np.where(dense > 0)[0]
-        if len(valid) == 0:
-            valid = np.array([0], dtype=np.int64)
-        start = len(action_feats_np)
-        for vi in valid:
-            af = np.zeros(ACTION_DIM, dtype=np.float32)
-            af[ACTION_BIAS_OFFSET] = 1.0
-            af[ACTION_CARD_OFFSET + (vi % CARD_DIM)] = 1.0
-            action_feats_np.append(af)
-            action_batch_idx.append(bi)
-        target_idx.append(start + int(np.argmax(dense[valid])))
 
-    action_feats = torch.from_numpy(np.stack(action_feats_np)).to(device)
+    for bi, (action_feats, policy) in enumerate(zip(action_feats_list, policies_list)):
+        if len(policy) == 0:
+            continue
+        flat_action_feats.append(action_feats)
+        flat_policy_targets.append(policy)
+        action_batch_idx.extend([bi] * len(policy))
+
+    if not flat_action_feats:
+        return None
+
+    action_feats = torch.from_numpy(np.concatenate(flat_action_feats, axis=0)).to(device)
+    policy_targets = torch.from_numpy(np.concatenate(flat_policy_targets, axis=0)).to(device)
     action_batch_index = torch.tensor(action_batch_idx, dtype=torch.long, device=device)
+
     logits, values = model(states, action_feats, action_batch_index)
 
     policy_loss = torch.tensor(0.0, device=device)
     for bi in range(batch_size):
         idx = (action_batch_index == bi).nonzero(as_tuple=False).squeeze(-1)
+        if idx.numel() == 0:
+            continue
         l = logits[idx]
-        tgt = torch.tensor([target_idx[bi] - int(idx[0].item())], device=device)
-        policy_loss = policy_loss + F.cross_entropy(l.unsqueeze(0), tgt)
+        tgt = policy_targets[idx]
+        log_probs = F.log_softmax(l, dim=0)
+        policy_loss = policy_loss - torch.sum(tgt * log_probs)
     policy_loss = policy_loss / batch_size
 
     value_loss = F.mse_loss(values, z)
@@ -411,7 +414,7 @@ def run(args: argparse.Namespace) -> None:
 
         active_games = [games[i] for i in active_idx]
         t = max(0.2, args.temperature_start * (1.0 - finished_games / max(1, args.num_games)))
-        chosen_actions, states_np, policies, value_players = choose_actions_batched(
+        chosen_actions, states_np, action_feat_targets, policies, value_players = choose_actions_batched(
             active_games,
             model,
             device,
@@ -422,7 +425,9 @@ def run(args: argparse.Namespace) -> None:
 
         for local_i, gi in enumerate(active_idx):
             g = games[gi]
-            episodes[gi].append(StepRecord(states_np[local_i], policies[local_i], value_players[local_i]))
+            episodes[gi].append(
+                StepRecord(states_np[local_i], action_feat_targets[local_i], policies[local_i], value_players[local_i])
+            )
             g.apply(chosen_actions[local_i])
             total_steps += 1
 
@@ -479,10 +484,11 @@ def run(args: argparse.Namespace) -> None:
         export_best_onnx(model, args.save_best_onnx, device)
 
     elapsed = time.time() - start_time
+    best_elo_out = best_elo if math.isfinite(best_elo) else float("nan")
     print(
         f"Done. games={finished_games}, elapsed={elapsed/3600:.2f}h, "
         f"games/hour={finished_games / max(elapsed/3600, 1e-6):.0f}, best_score={best_score:.4f}, "
-        f"best_elo={best_elo:.1f}, winner_fraction={decisive_finished_games / max(finished_games, 1):.3f}",
+        f"best_elo={best_elo_out:.1f}, winner_fraction={decisive_finished_games / max(finished_games, 1):.3f}",
         flush=True,
     )
 
